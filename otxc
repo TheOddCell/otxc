@@ -35,7 +35,10 @@ auth_args=()
 build_auth() {
     auth_args=()
     if [ -n "${OTXC_USER:-}" ]; then
-        auth_args=(-u "${OTXC_USER}:${OTXC_PASS}")
+        auth_args=(-u "${OTXC_USER}")
+        if [ "${OTXC_PASS}" != "-" ]; then
+             auth_args=(-u "${OTXC_USER}:${OTXC_PASS}")
+        fi
     fi
 }
 
@@ -103,7 +106,7 @@ case "$cmd" in
                 ;;
             auth)
                 OTXC_USER="${1:?username required}"
-                OTXC_PASS="${2:?password required}"
+                OTXC_PASS="${2:--}"
                 save_conf
                 echo "auth set for $OTXC_USER"
                 ;;
