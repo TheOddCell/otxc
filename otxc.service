@@ -1,0 +1,14 @@
+[Unit]
+Description=otxc registry server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/share/otxc/otxc_server.py --port 8080 --data-dir /var/lib/otxc
+Restart=on-failure
+User=otxc
+WorkingDirectory=/var/lib/otxc
+StateDirectory=otxc
+
+[Install]
+WantedBy=multi-user.target
