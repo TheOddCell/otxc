@@ -39,6 +39,38 @@ build_auth() {
     fi
 }
 
+# Resolve ns/image/tag to a final url by walking the manifest client-side.
+# Handles both forms of redirect: (main's bare-string shortcut, and a normal
+# tag entry whose "url" is itself "redirect:ns/image/tag"). This has to
+# happen client-side because a purely static registry (e.g. one hosted as
+# raw files in a git repo) has no server logic to do it for you.
+resolve_url() {
+    local manifest="$1" ns="$2" image="$3" tag="$4" depth=0 nodetype val target
+    while [ "$depth" -lt 10 ]; do
+        nodetype=$(jq -r --arg ns "$ns" --arg image "$image" '.[$ns][$image] | type' <<<"$manifest")
+        if [ "$nodetype" = "null" ]; then
+            return 1
+        elif [ "$nodetype" = "string" ]; then
+            val=$(jq -r --arg ns "$ns" --arg image "$image" '.[$ns][$image]' <<<"$manifest")
+        else
+            val=$(jq -r --arg ns "$ns" --arg image "$image" --arg tag "$tag" '.[$ns][$image][$tag].url // empty' <<<"$manifest")
+            [ -z "$val" ] && return 1
+        fi
+        case "$val" in
+            redirect:*)
+                target="${val#redirect:}"
+                IFS='/' read -r ns image tag <<<"$target"
+                depth=$((depth + 1))
+                ;;
+            *)
+                echo "$val"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 usage() {
     cat >&2 <<EOF
 otxc - client for an otxc registry
@@ -109,7 +141,24 @@ case "$cmd" in
         build_auth
         ref="${1:?ns/image/tag required}"
         out="${2:-$(basename "$ref").tar.xz}"
-        curl -sS -L "${auth_args[@]}" -o "$out" "$REGISTRY/$ref"
+        IFS='/' read -r ns image tag <<<"$ref"
+        manifest=$(curl -sS "${auth_args[@]}" "$REGISTRY/manifest.json")
+        url=$(resolve_url "$manifest" "$ns" "$image" "$tag") || {
+            echo "no such image/tag (or broken redirect): $ref" >&2
+            exit 1
+        }
+        case "$url" in
+            http://* | https://* | ftp://*)
+                curl -sS -fL "${auth_args[@]}" -o "$out" "$url"
+                ;;
+            /*)
+                curl -sS -fL "${auth_args[@]}" -o "$out" "$REGISTRY$url"
+                ;;
+            *)
+                echo "unrecognized url scheme in manifest: $url" >&2
+                exit 1
+                ;;
+        esac
         echo "saved to $out"
         ;;
 
