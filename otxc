@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# otxc - bash/curl client for an otxc-server registry
+set -euo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/otxc"
+CONF_FILE="$CONF_DIR/config"
+
+load_conf() {
+    REGISTRY=""
+    OTXC_USER=""
+    OTXC_PASS=""
+    if [ -f "$CONF_FILE" ]; then
+        source "$CONF_FILE"
+    fi
+}
+
+save_conf() {
+    mkdir -p "$CONF_DIR"
+    {
+        echo "REGISTRY=\"${REGISTRY:-}\""
+        echo "OTXC_USER=\"${OTXC_USER:-}\""
+        echo "OTXC_PASS=\"${OTXC_PASS:-}\""
+    } > "$CONF_FILE"
+    chmod 600 "$CONF_FILE"
+}
+
+need_registry() {
+    if [ -z "${REGISTRY:-}" ]; then
+        echo "no registry configured, run: otxc config registry <url>" >&2
+        exit 1
+    fi
+}
+
+auth_args=()
+build_auth() {
+    auth_args=()
+    if [ -n "${OTXC_USER:-}" ]; then
+        auth_args=(-u "${OTXC_USER}:${OTXC_PASS}")
+    fi
+}
+
+usage() {
+    cat >&2 <<EOF
+otxc - client for an otxc registry
+
+  otxc config registry <url>              set the registry base url
+  otxc config auth <user> <pass>          set basic auth creds
+  otxc adduser <user> <pass>              register a user (first ever = admin)
+  otxc users                              list registered users
+  otxc manifest                           dump the manifest (auth-aware)
+  otxc pull <ns>/<image>/<tag> <outfile>  download/follow-redirect an image
+  otxc push <ns>/<image>/<tag> <file>     upload a file as an image
+  otxc patch <ns>/<image>/<tag> <json>    edit entry metadata
+  otxc redirect <image> <ns>/<image>/<tag> point main/<image> at a target
+  otxc rm <ns>/<image>/<tag>              delete an entry (or main/<image>)
+EOF
+    exit 1
+}
+
+load_conf
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+    config)
+        sub="${1:-}"; shift || true
+        case "$sub" in
+            registry)
+                REGISTRY="${1:?url required}"
+                save_conf
+                echo "registry set to $REGISTRY"
+                ;;
+            auth)
+                OTXC_USER="${1:?username required}"
+                OTXC_PASS="${2:?password required}"
+                save_conf
+                echo "auth set for $OTXC_USER"
+                ;;
+            *)
+                usage
+                ;;
+        esac
+        ;;
+
+    adduser)
+        need_registry
+        build_auth
+        user="${1:?username required}"
+        pass="${2:?password required}"
+        curl -sS "${auth_args[@]}" -X PUT "$REGISTRY/_users" \
+            -d "{\"username\":\"$user\",\"password\":\"$pass\"}"
+        echo
+        ;;
+
+    users)
+        need_registry
+        curl -sS "$REGISTRY/_users?list"
+        echo
+        ;;
+
+    manifest)
+        need_registry
+        build_auth
+        curl -sS "${auth_args[@]}" "$REGISTRY/manifest.json"
+        echo
+        ;;
+
+    pull)
+        need_registry
+        build_auth
+        ref="${1:?ns/image/tag required}"
+        out="${2:-$(basename "$ref").tar.xz}"
+        curl -sS -L "${auth_args[@]}" -o "$out" "$REGISTRY/$ref"
+        echo "saved to $out"
+        ;;
+
+    push)
+        need_registry
+        build_auth
+        ref="${1:?ns/image/tag required}"
+        file="${2:?file required}"
+        curl -sS "${auth_args[@]}" -X PUT --data-binary "@$file" "$REGISTRY/$ref"
+        echo
+        ;;
+
+    patch)
+        need_registry
+        build_auth
+        ref="${1:?ns/image/tag required}"
+        json="${2:?json body required}"
+        curl -sS "${auth_args[@]}" -X PATCH "$REGISTRY/$ref" -d "$json"
+        echo
+        ;;
+
+    redirect)
+        need_registry
+        build_auth
+        image="${1:?image name required}"
+        target="${2:?ns/image/tag target required}"
+        curl -sS "${auth_args[@]}" -X PATCH "$REGISTRY/main/$image/_" \
+            -d "{\"redirect\":\"$target\"}"
+        echo
+        ;;
+
+    rm)
+        need_registry
+        build_auth
+        ref="${1:?ns/image/tag or main/image required}"
+        curl -sS "${auth_args[@]}" -X DELETE "$REGISTRY/$ref"
+        echo
+        ;;
+
+    *)
+        usage
+        ;;
+esac
