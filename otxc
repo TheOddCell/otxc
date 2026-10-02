@@ -175,8 +175,10 @@ otxc - client for an otxc registry
   otxc users                              list registered users
   otxc manifest                           dump the manifest (auth-aware)
   otxc pull <ns>/<image>/<tag> <outfile>  download/follow-redirect an image
-  otxc pull <ns>/<image>/<tag> --dir      extract the image into a random tmpdir
-  otxc pull <ns>/<image>/<tag> --nspawn   like --dir, then boot it with systemd-nspawn
+  otxc pull <ns>/<image>/<tag> --dir [path]
+                                          extract the image into path (a random tmpdir if none given)
+  otxc pull <ns>/<image>/<tag> --nspawn [path]
+                                          like --dir, then boot it with systemd-nspawn
   otxc push <ns>/<image>/<tag> <file>     upload a file as an image
   otxc patch <ns>/<image>/<tag> <json>    edit entry metadata
   otxc redirect <image> <ns>/<image>/<tag> point main/<image> at a target
@@ -325,10 +327,8 @@ case "$cmd" in
     pull)
         need_registry
         ref="${1:?ns/image/tag required}"
-        if [ -n "$use_dir" ] && [ -n "${2:-}" ]; then
-            echo "--dir/--nspawn extract to a tmpdir, an outfile can't be given too" >&2
-            exit 1
-        fi
+        # with --dir/--nspawn the optional second argument is the directory to extract into
+        dest="${2:-}"
         out="${2:-$(basename "$ref").tar.xz}"
         url=""
         for i in "${!CAND_URLS[@]}"; do
@@ -350,7 +350,16 @@ case "$cmd" in
             if [ "$(id -u)" -ne 0 ]; then
                 as_root=(sudo)
             fi
-            tmp=$(mktemp -d /tmp/XXXXXXXXXXXXXXXXXX)
+            if [ -n "$dest" ]; then
+                tmp="${dest%/}"
+                if [ -d "$tmp" ] && [ -n "$("${as_root[@]}" ls -A -- "$tmp")" ]; then
+                    echo "$tmp isn't empty" >&2
+                    exit 1
+                fi
+                "${as_root[@]}" mkdir -p -- "$tmp"
+            else
+                tmp=$(mktemp -d /tmp/XXXXXXXXXXXXXXXXXX)
+            fi
             if ! curl -sS -fL "${auth_args[@]}" "$url" | xz -d | "${as_root[@]}" tar --numeric-owner -xpf - -C "$tmp"; then
                 echo "pull/extract failed, removing $tmp" >&2
                 "${as_root[@]}" rm -rf -- "$tmp"
