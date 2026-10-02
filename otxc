@@ -356,7 +356,7 @@ case "$cmd" in
                 "${as_root[@]}" rm -rf -- "$tmp"
                 exit 1
             fi
-            echo "extracted to $tmp"
+            echo "$tmp"
             if [ -n "$use_nspawn" ]; then
                 "${as_root[@]}" systemd-nspawn -D "$tmp" sh -c "passwd -d root;exec init"
             fi
