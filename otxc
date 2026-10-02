@@ -5,30 +5,98 @@ set -euo pipefail
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/otxc"
 CONF_FILE="$CONF_DIR/config"
 
+REG_URLS=()
+REG_USERS=()
+REG_PASSES=()
+
 load_conf() {
+    REG_URLS=()
+    REG_USERS=()
+    REG_PASSES=()
     REGISTRY=""
     OTXC_USER=""
     OTXC_PASS=""
     if [ -f "$CONF_FILE" ]; then
         source "$CONF_FILE"
     fi
+    # old single-registry config files only set REGISTRY/OTXC_USER/OTXC_PASS
+    if [ "${#REG_URLS[@]}" -eq 0 ] && [ -n "${REGISTRY:-}" ]; then
+        REG_URLS=("$REGISTRY")
+        REG_USERS=("${OTXC_USER:-}")
+        REG_PASSES=("${OTXC_PASS:-}")
+    fi
+}
+
+write_array() {
+    local -n arr="$1"
+    printf '%s=(' "$1"
+    if [ "${#arr[@]}" -gt 0 ]; then
+        printf ' %q' "${arr[@]}"
+    fi
+    printf ' )\n'
 }
 
 save_conf() {
     mkdir -p "$CONF_DIR"
     {
-        echo "REGISTRY=\"${REGISTRY:-}\""
-        echo "OTXC_USER=\"${OTXC_USER:-}\""
-        echo "OTXC_PASS=\"${OTXC_PASS:-}\""
+        write_array REG_URLS
+        write_array REG_USERS
+        write_array REG_PASSES
     } > "$CONF_FILE"
     chmod 600 "$CONF_FILE"
 }
 
+# index of a configured registry url, or non-zero if it isn't configured
+registry_index() {
+    local i
+    for i in "${!REG_URLS[@]}"; do
+        if [ "${REG_URLS[$i]}" = "$1" ]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Registries a command may use: just the one given with -r, or all configured
+# ones in order. A -r url that isn't configured is used as-is, without auth.
+build_candidates() {
+    CAND_URLS=()
+    CAND_USERS=()
+    CAND_PASSES=()
+    local idx
+    if [ -n "$only_registry" ]; then
+        if idx=$(registry_index "${only_registry%/}"); then
+            CAND_URLS=("${REG_URLS[$idx]}")
+            CAND_USERS=("${REG_USERS[$idx]}")
+            CAND_PASSES=("${REG_PASSES[$idx]}")
+        else
+            CAND_URLS=("${only_registry%/}")
+            CAND_USERS=("")
+            CAND_PASSES=("")
+        fi
+    else
+        CAND_URLS=("${REG_URLS[@]}")
+        CAND_USERS=("${REG_USERS[@]}")
+        CAND_PASSES=("${REG_PASSES[@]}")
+    fi
+}
+
+use_candidate() {
+    REGISTRY="${CAND_URLS[$1]}"
+    OTXC_USER="${CAND_USERS[$1]}"
+    OTXC_PASS="${CAND_PASSES[$1]}"
+    build_auth
+}
+
+# selects the first candidate registry (-r one if given, else the first configured)
 need_registry() {
-    if [ -z "${REGISTRY:-}" ]; then
-        echo "no registry configured, run: otxc config registry <url>" >&2
+    build_candidates
+    if [ "${#CAND_URLS[@]}" -eq 0 ]; then
+        echo "no registry configured, run: otxc config registry add <url>" >&2
         exit 1
     fi
+    use_candidate 0
 }
 
 auth_args=()
@@ -74,41 +142,156 @@ resolve_url() {
     return 1
 }
 
+# Resolve a ref against the currently selected registry and print the full
+# download url.
+registry_resolve() {
+    local ref="$1" ns image tag manifest url
+    IFS='/' read -r ns image tag <<<"$ref"
+    manifest=$(curl -sS "${auth_args[@]}" "$REGISTRY/manifest.json") || return 1
+    url=$(resolve_url "$manifest" "$ns" "$image" "$tag") || return 1
+    case "$url" in
+        http://* | https://* | ftp://*)
+            echo "$url"
+            ;;
+        /*)
+            echo "$REGISTRY$url"
+            ;;
+        *)
+            echo "unrecognized url scheme in manifest: $url" >&2
+            return 1
+            ;;
+    esac
+}
+
 usage() {
     cat >&2 <<EOF
 otxc - client for an otxc registry
 
-  otxc config registry <url>              set the registry base url
-  otxc config auth <user> <pass>          set basic auth creds
+  otxc config registry add <url>          add a registry
+  otxc config registry rm <url>           remove a registry
+  otxc config registry list               list registries (in lookup order)
+  otxc config auth <user> <pass> [<url>]  set basic auth creds (first registry if no url)
   otxc adduser <user> <pass>              register a user (first ever = admin)
   otxc users                              list registered users
   otxc manifest                           dump the manifest (auth-aware)
   otxc pull <ns>/<image>/<tag> <outfile>  download/follow-redirect an image
+  otxc pull <ns>/<image>/<tag> --dir      extract the image into a random tmpdir
+  otxc pull <ns>/<image>/<tag> --nspawn   like --dir, then boot it with systemd-nspawn
   otxc push <ns>/<image>/<tag> <file>     upload a file as an image
   otxc patch <ns>/<image>/<tag> <json>    edit entry metadata
   otxc redirect <image> <ns>/<image>/<tag> point main/<image> at a target
   otxc rm <ns>/<image>/<tag>              delete an entry (or main/<image>)
+
+  -r, --registry <url>                    use only this registry (any command)
+
+with several registries, pull tries each in order; every other command uses
+the first one unless -r is given.
 EOF
     exit 1
 }
 
+only_registry=""
+use_dir=""
+use_nspawn=""
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -r | --registry)
+            only_registry="${2:?registry url required}"
+            shift 2
+            ;;
+        --dir)
+            use_dir=1
+            shift
+            ;;
+        --nspawn)
+            use_nspawn=1
+            use_dir=1
+            shift
+            ;;
+        *)
+            args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${args[@]}"
+
 load_conf
 cmd="${1:-}"; shift || true
+
+if [ -n "$use_dir" ] && [ "$cmd" != "pull" ]; then
+    echo "--dir/--nspawn only apply to pull" >&2
+    exit 1
+fi
 
 case "$cmd" in
     config)
         sub="${1:-}"; shift || true
         case "$sub" in
             registry)
-                REGISTRY="${1:?url required}"
-                save_conf
-                echo "registry set to $REGISTRY"
+                action="${1:-}"; shift || true
+                case "$action" in
+                    list | "")
+                        for i in "${!REG_URLS[@]}"; do
+                            if [ -n "${REG_USERS[$i]}" ]; then
+                                echo "${REG_URLS[$i]} (auth: ${REG_USERS[$i]})"
+                            else
+                                echo "${REG_URLS[$i]}"
+                            fi
+                        done
+                        ;;
+                    rm)
+                        url="${1:?url required}"; url="${url%/}"
+                        idx=$(registry_index "$url") || {
+                            echo "not a configured registry: $url" >&2
+                            exit 1
+                        }
+                        unset 'REG_URLS[idx]' 'REG_USERS[idx]' 'REG_PASSES[idx]'
+                        REG_URLS=("${REG_URLS[@]}")
+                        REG_USERS=("${REG_USERS[@]}")
+                        REG_PASSES=("${REG_PASSES[@]}")
+                        save_conf
+                        echo "removed $url"
+                        ;;
+                    *)
+                        # "add <url>", or a bare "<url>" for the old `config registry <url>` form
+                        if [ "$action" = "add" ]; then
+                            url="${1:?url required}"
+                        else
+                            url="$action"
+                        fi
+                        url="${url%/}"
+                        if registry_index "$url" >/dev/null; then
+                            echo "already configured: $url"
+                        else
+                            REG_URLS+=("$url")
+                            REG_USERS+=("")
+                            REG_PASSES+=("")
+                            save_conf
+                            echo "registry added: $url"
+                        fi
+                        ;;
+                esac
                 ;;
             auth)
-                OTXC_USER="${1:?username required}"
-                OTXC_PASS="${2:--}"
+                user="${1:?username required}"
+                pass="${2:?password required}"
+                if [ -n "${3:-}" ]; then
+                    idx=$(registry_index "${3%/}") || {
+                        echo "not a configured registry: $3" >&2
+                        exit 1
+                    }
+                elif [ "${#REG_URLS[@]}" -gt 0 ]; then
+                    idx=0
+                else
+                    echo "no registry configured, run: otxc config registry add <url>" >&2
+                    exit 1
+                fi
+                REG_USERS[idx]="$user"
+                REG_PASSES[idx]="$pass"
                 save_conf
-                echo "auth set for $OTXC_USER"
+                echo "auth set for $user on ${REG_URLS[$idx]}"
                 ;;
             *)
                 usage
@@ -141,28 +324,46 @@ case "$cmd" in
 
     pull)
         need_registry
-        build_auth
         ref="${1:?ns/image/tag required}"
+        if [ -n "$use_dir" ] && [ -n "${2:-}" ]; then
+            echo "--dir/--nspawn extract to a tmpdir, an outfile can't be given too" >&2
+            exit 1
+        fi
         out="${2:-$(basename "$ref").tar.xz}"
-        IFS='/' read -r ns image tag <<<"$ref"
-        manifest=$(curl -sS "${auth_args[@]}" "$REGISTRY/manifest.json")
-        url=$(resolve_url "$manifest" "$ns" "$image" "$tag") || {
+        url=""
+        for i in "${!CAND_URLS[@]}"; do
+            use_candidate "$i"
+            if url=$(registry_resolve "$ref"); then
+                break
+            fi
+            url=""
+        done
+        if [ -z "$url" ]; then
             echo "no such image/tag (or broken redirect): $ref" >&2
             exit 1
-        }
-        case "$url" in
-            http://* | https://* | ftp://*)
-                curl -sS -fL "${auth_args[@]}" -o "$out" "$url"
-                ;;
-            /*)
-                curl -sS -fL "${auth_args[@]}" -o "$out" "$REGISTRY$url"
-                ;;
-            *)
-                echo "unrecognized url scheme in manifest: $url" >&2
+        fi
+        if [ "${#CAND_URLS[@]}" -gt 1 ]; then
+            echo "found on $REGISTRY" >&2
+        fi
+        if [ -n "$use_dir" ]; then
+            as_root=()
+            if [ "$(id -u)" -ne 0 ]; then
+                as_root=(sudo)
+            fi
+            tmp=$(mktemp -d /tmp/XXXXXXXXXXXXXXXXXX)
+            if ! curl -sS -fL "${auth_args[@]}" "$url" | xz -d | "${as_root[@]}" tar --numeric-owner -xpf - -C "$tmp"; then
+                echo "pull/extract failed, removing $tmp" >&2
+                "${as_root[@]}" rm -rf -- "$tmp"
                 exit 1
-                ;;
-        esac
-        echo "saved to $out"
+            fi
+            echo "extracted to $tmp"
+            if [ -n "$use_nspawn" ]; then
+                "${as_root[@]}" systemd-nspawn -D "$tmp" sh -c "passwd -d root;exec init"
+            fi
+        else
+            curl -sS -fL "${auth_args[@]}" -o "$out" "$url"
+            echo "saved to $out"
+        fi
         ;;
 
     push)
